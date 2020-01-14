@@ -1,0 +1,14 @@
+verbosity: debug
+listen: "127.0.0.1:20003"
+
+backends:
+    main:
+        address: "localhost:2004"
+
+default_routes: [ trash ]
+rules:
+- match: "bad-prefix"
+  routes: []
+- match: "apps.*"
+  routes:
+      - main
