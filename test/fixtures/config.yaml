@@ -1,14 +1,35 @@
 verbosity: debug
 listen: "127.0.0.1:20003"
-
+task-queue-size: 65535
+workers: 32
+stats-interval: 2000
+stats-prefix: "own-stats.test"
+log-parse-errors: true
+carbon:
+    max-line-len: 20000
 backends:
     main:
+        queue-len: 2048
         address: "localhost:2004"
-
-default_routes: [ trash ]
+    unmatched:
+        address: "localhost:2005"
+    rewritten:
+        address: "localhost:2006"
+    own:
+        address: "localhost:2042"
+nomatch:
+    stop: true
+    forward: [ unmatched ]
 rules:
 - match: "bad-prefix"
-  routes: []
+  stop: true
+- match: "own-stats"
+  forward: [ own ]
+  stop: true
+- match: "rewrite-me"
+  rewrite: "apps.rewritten"
+  forward: [ rewritten ]
+  stop: true
 - match: "apps.*"
-  routes:
-      - main
+  forward:
+  - main

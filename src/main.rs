@@ -1,68 +1,47 @@
+mod backend;
 mod carbon;
 mod config;
+mod scheduler;
+mod util;
 
-use std::io;
 use std::str::FromStr;
-use std::sync::{Arc, Mutex};
 
-//use log::info;
+use log::warn;
 use slog::{o, Drain, Level};
 
-use bytes::Bytes;
-use futures::channel::mpsc;
-use futures::{FutureExt, SinkExt, StreamExt};
+use futures::FutureExt;
 use tokio::spawn;
+use tokio::sync::mpsc::{channel, unbounded_channel};
 
 use crate::carbon::CarbonServer;
-use once_cell::sync::Lazy;
+use crate::scheduler::{Scheduler, SchedulingError};
 
 use crate::config::CONFIG;
-
-//pub static OUTS: Lazy<RwLock<mpsc::Sender<Bytes>>> = sync_lazy! {
-//let (tx, _) = mpsc::channel(1);
-//RwLock::new(tx)
-//};
-
-pub type Float = f64;
+use crate::util::OwnStats;
 
 #[tokio::main]
 async fn async_main() {
-    //let carbon_server_addr: std::net::SocketAddr = //"127.0.0.1:2003".parse().expect("parsing");
-    let carbon_server = CarbonServer::new();
-    //spawn(carbon_server.main().map(|_|()));
-    carbon_server.main().map(|_| ()).await;
+    let (sched_tx, sched_rx) = channel(c!(task_queue_size));
+    let (cmd_tx, cmd_rx) = unbounded_channel();
+    let (own_tx, own_rx) = unbounded_channel();
 
-    //let (tx, rx) = oneshot::channel();
+    let own_stats = OwnStats::new(sched_tx.clone(), own_rx);
+    spawn(own_stats.main());
 
-    /*
-     *
-    tokio::spawn(async move {
-        let ch_rx: mpsc::Receiver<Bytes> = rx.await.unwrap();
+    let carbon_server = CarbonServer::new(sched_tx);
 
-        ch_rx.for_each(
-        //TODO maybe concurrent processing
-        // rx.for_each_concurrent(
-        //    None,
-            |query| async move {
-                client::http_query(query).await
-            }).await;
-    });
+    // TODO error
+    spawn(carbon_server.main().map(|_| ()));
 
-    // cache updater
-    tokio::spawn(async move {
-        use std::time::Duration;
-        let tick = tokio::timer::Interval::new_interval(Duration::from_millis(10000));
+    spawn(crate::util::config_watcher(cmd_tx));
 
-        tick.for_each(
-            |_| async move {
-                let mut expired = (*CACHE).list_expired();
-                for query in expired.drain(..) {
-                    info!("REFRESH {:?}", query);
-                    client::http_query(query).await
-                }
-            }).await;
-    });
-     */
+    // backends will be run by scheduler because they are dynamically created based on config
+    // re-reads
+    let scheduler = Scheduler::new(own_tx);
+    scheduler
+        .main(sched_rx, cmd_rx)
+        .await
+        .expect("scheduler exit");
 }
 
 fn main() {
@@ -79,8 +58,12 @@ fn main() {
     let decorator = slog_term::TermDecorator::new().build();
     let drain = slog_term::FullFormat::new(decorator).build().fuse();
     let filter = slog::LevelFilter::new(drain, verbosity).fuse();
-    let drain = slog_async::Async::new(filter).build().fuse();
-    let rlog = slog::Logger::root(drain, o!("program"=>"bioproxy"));
+    let drain = slog_async::Async::new(filter)
+        .chan_size(65536)
+        .overflow_strategy(slog_async::OverflowStrategy::Drop)
+        .build()
+        .fuse();
+    let rlog = slog::Logger::root(drain, o!("program"=>"merenga"));
     // this lets root logger live as long as it needs
     let _guard = slog_scope::set_global_logger(rlog.clone());
 

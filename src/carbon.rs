@@ -1,32 +1,34 @@
-use std::io::Write;
 use std::net::SocketAddr;
 use std::str;
 
 use thiserror::Error;
 
 use bytes::{Buf, BytesMut};
-use futures::stream::{StreamExt, TryStreamExt};
-use futures::{future, TryFutureExt};
+use futures::stream::StreamExt;
+use futures::TryFutureExt;
 use log::info;
 use tokio::net::{TcpListener, TcpStream};
 use tokio::spawn;
 
 use tokio_util::codec::{Decoder, Encoder};
 
-use crate::c;
-use crate::Float;
-use bioyino_metric::{name::TagFormat, Metric, MetricName, MetricType};
+use crate::util::*;
+use crate::{c, s};
+use bioyino_metric::{name::TagFormat, Metric, MetricName, MetricType, NamedMetric64};
 
 #[derive(Error, Debug)]
 pub enum CarbonServerError {
     #[error("i/o error")]
     TokioIo(#[from] tokio::io::Error),
 
-    #[error("spawning blocking task")]
-    SpawnBlocking(#[from] tokio::task::JoinError),
+    #[error("no data to parse")]
+    Empty,
 
-    #[error("decode error")]
-    Decode,
+    #[error("no value provided after name")]
+    ValueExpected,
+
+    #[error("no timestamp after value")]
+    TimestampExpected,
 
     #[error("float parsing error")]
     ParseFloat(#[from] std::num::ParseFloatError),
@@ -39,36 +41,58 @@ pub enum CarbonServerError {
 
     #[error("name parsing error")]
     Name,
+
+    #[error("sending metric to scheduler")]
+    Scheduling,
 }
 
 #[derive(Clone)]
 pub struct CarbonServer {
     addr: SocketAddr,
     max_line_len: usize,
+    sched: MetricSender,
 }
 
 impl CarbonServer {
-    //pub(crate) fn new(addr: SocketAddr, channel: Sender<Metric<Float>>, log: Logger) -> Self {
-    pub(crate) fn new() -> Self {
+    pub(crate) fn new(sched: MetricSender) -> Self {
         Self {
             addr: c!(listen),
-            max_line_len: 65535,
+            max_line_len: c!(carbon.max_line_len),
+            sched,
         }
     }
 
     pub(crate) async fn main(self) -> Result<(), CarbonServerError> {
-        let Self { addr, max_line_len } = self;
+        let Self {
+            addr,
+            max_line_len,
+            sched,
+        } = self;
         let mut listener = TcpListener::bind(&addr).await?;
         loop {
-            let (mut socket, _) = listener.accept().await?;
-            let codec = CarbonDecoder::new(max_line_len);
-            let parser = codec.framed(socket).try_for_each(|metric| {
-                tokio::task::spawn_blocking(|| {
-                    // TODO "smart batching":  stack+heap vector or rope-based something
-                    dbg!(metric);
-                })
-                .map_err(|e| e.into())
-            });
+            let max_line_len = max_line_len.clone();
+            let (socket, _) = listener.accept().await?;
+            s!(connects);
+            let mut sched = sched.clone();
+            let parser = async move {
+                let codec = CarbonDecoder::new(max_line_len.clone());
+                let mut input = codec.framed(socket);
+                loop {
+                    let metric = match input.next().await {
+                        Some(Ok(m)) => m,
+                        Some(Err(_e)) => continue, // TODO: process error
+                        None => break,
+                    };
+                    sched
+                        .send(metric)
+                        .map_err(|_| CarbonServerError::Scheduling)
+                        .await?;
+                    // TODO error
+                }
+                s!(disconnects);
+                Ok::<(), CarbonServerError>(())
+            };
+
             spawn(parser);
         }
     }
@@ -89,28 +113,25 @@ impl CarbonDecoder {
         }
     }
 
-    fn parse_line(
-        &mut self,
-        mut line: BytesMut,
-    ) -> Result<(MetricName, Metric<Float>), CarbonServerError> {
+    fn parse_line(&mut self, mut line: BytesMut) -> Result<NamedMetric64, CarbonServerError> {
         let (name_len, value, ts) = {
             let parts = &mut line[..]
                 .split(|&c| c == b' ')
                 .filter(|part| !part.is_empty());
-            let name_len = parts.next().ok_or(CarbonServerError::Decode)?.len();
-            let value = parts.next().ok_or(CarbonServerError::Decode)?;
+            let name_len = parts.next().ok_or(CarbonServerError::Empty)?.len();
+            let value = parts.next().ok_or(CarbonServerError::ValueExpected)?;
 
             // TODO: probably use nom::...double and atoi crate for parsing directly from bytes to avoid
             // walking the buffer one extra time
             let value: f64 = str::from_utf8(value)?.parse()?;
-            let ts = parts.next().ok_or(CarbonServerError::Decode)?;
+            let ts = parts.next().ok_or(CarbonServerError::TimestampExpected)?;
             let ts: u64 = str::from_utf8(ts)?.parse()?;
 
             (name_len, value, ts)
         };
 
         let name = MetricName::new(
-            bytes4::BytesMut::from(&line.split_to(name_len)[..]),
+            BytesMut::from(&line.split_to(name_len)[..]),
             TagFormat::Graphite,
             &mut self.sort_buf,
         )
@@ -119,12 +140,12 @@ impl CarbonDecoder {
         // unwrap is OK here
         // in carbon we don't know the type of metric, so all of them are of type gauge
         let metric = Metric::new(value, MetricType::Gauge(None), Some(ts), None).unwrap();
-        Ok((name, metric))
+        Ok(NamedMetric64::new(name, metric))
     }
 }
 
 impl Decoder for CarbonDecoder {
-    type Item = (MetricName, Metric<Float>);
+    type Item = NamedMetric64;
     type Error = CarbonServerError;
 
     fn decode(&mut self, buf: &mut BytesMut) -> Result<Option<Self::Item>, Self::Error> {
@@ -133,6 +154,7 @@ impl Decoder for CarbonDecoder {
             return Ok(None);
         }
 
+        let log_parse_errors = c!(log_parse_errors);
         // we need  loop here for skipping parsing errors, it only continues when there is an error
         // between some newlines
         // in all good cases it just returns
@@ -140,16 +162,27 @@ impl Decoder for CarbonDecoder {
             let len = buf.len();
             // we dont' do any job until we meet a new line or we are at eof
             // (or eof, but this case is in decode_eof function)
-            match &buf[self.last_pos..len - 1].iter().position(|c| *c == b'\n') {
+            match &buf[self.last_pos..len].iter().position(|c| *c == b'\n') {
                 Some(pos) => {
-                    let line = buf.split_to(*pos);
+                    let line = buf.split_to(self.last_pos + *pos);
                     buf.advance(1); // remove \n itself
                     self.last_pos = 0;
+                    let eline = if log_parse_errors {
+                        Some(line.clone())
+                    } else {
+                        None
+                    };
                     match self.parse_line(line) {
                         Ok(res) => return Ok(Some(res)),
                         Err(e) => {
-                            // TODO Count errors as metric
-                            info!("parsing metric: {:?}", e);
+                            s!(parsing);
+                            if let Some(line) = eline {
+                                info!(
+                                    "parsing metric from {:?}: {:?}",
+                                    String::from_utf8_lossy(&line),
+                                    e
+                                );
+                            }
                             continue;
                         }
                     }
@@ -162,7 +195,7 @@ impl Decoder for CarbonDecoder {
                         buf.advance(self.last_pos);
                         self.last_pos = 0;
                     } else {
-                        // otherway it's still ok
+                        // otherways it's still ok
                         self.last_pos = len - 1;
                     }
                     //  regardless of result we have not anough data to do anything
@@ -184,8 +217,11 @@ impl Decoder for CarbonDecoder {
                 match self.parse_line(buf.split()) {
                     Ok(res) => return Ok(Some(res)),
                     Err(e) => {
-                        // TODO Count errors as metric
-                        info!("parsing metric: {:?}", e);
+                        if let CarbonServerError::Empty = e {
+                        } else {
+                            info!("parsing metric: {:?}", e);
+                        }
+                        s!(parsing);
                         return Ok(None);
                     }
                 }
@@ -199,52 +235,9 @@ impl Encoder for CarbonDecoder {
     type Error = CarbonServerError;
 
     fn encode(&mut self, _: Self::Item, _buf: &mut BytesMut) -> Result<(), Self::Error> {
-        todo!()
-    }
-}
-
-/*
-pub struct CarbonEncoder;
-
-impl Encoder for CarbonEncoder {
-    type Item = (Bytes, Metric<Float>); // Metric name, value and timestamp
-    type Error = Error;
-
-    fn encode(&mut self, m: Self::Item, buf: &mut BytesMut) -> Result<(), Self::Error> {
-        buf.reserve(m.0.len() + 20 + 20); // FIXME: too long to count, just allocate 19 bytes for float and 19 for u64
-        buf.put(m.0);
-        buf.put(" ");
-
-        let mut wr = buf.writer();
-        ftoa::write(&mut wr, m.1.value).map_err(|_| GeneralError::CarbonBackend)?;
-        wr.write(&b" "[..]).unwrap();
-
-        itoa::write(&mut wr, m.1.timestamp.unwrap()).map_err(|_| GeneralError::CarbonBackend)?;
-        wr.write(&b"\n"[..]).unwrap();
-
-        // let len = m.0.len() + 1 + m.1.len() + 1 + m.2.len() + 1;
-        //buf.reserve(len);
-        //buf.put(m.0);
-        //buf.put(" ");
-        //buf.put(m.1);
-        //buf.put(" ");
-        //buf.put(m.2);
-        // buf.put("\n");
-        Ok(())
-    }
-}
-
-impl Decoder for CarbonEncoder {
-    type Item = ();
-    // It could be a separate error here, but it's useless, since there is no errors in process of
-    // encoding
-    type Error = GeneralError;
-
-    fn decode(&mut self, _buf: &mut BytesMut) -> Result<Option<Self::Item>, Self::Error> {
         unreachable!()
     }
 }
-*/
 
 #[cfg(test)]
 mod tests {
@@ -252,59 +245,57 @@ mod tests {
     use std::time::Duration;
 
     use bytes::Bytes;
-    use once_cell::sync::Lazy;
     use tokio::prelude::*;
     use tokio::runtime::Builder;
+    use tokio::sync::mpsc::channel;
 
     use crate::config::CONFIG;
-
-    /*
-        #[test]
-        fn carbon_parser() {
-            /*
-            let lines = [
-                b"gorets.bobez;tag2=value;tag1=value 1000 1576644030",
-                b"gorets.bobez;tag2=value;tag1=value   -10e4   1576644030",
-            ];
-            */
-
-            //
-        }
-    */
-
-    fn init_config() {
-        let mut test_config = CONFIG.lock().unwrap();
-        test_config.listen = "127.0.0.1:20003".parse().unwrap();
-        test_config.file = "test/fixtures/config.yaml".into();
-        test_config.load().expect("loading test config");
-        dbg!(&test_config);
-    }
+    use crate::util::test::*;
 
     #[test]
     fn carbon_server() {
         init_config();
-        let input = Bytes::from("gorets.bobez.1;tag2=value;tag1=value 1000 1576644030\n\ngorets.bobez.2;tag2=value;tag1=value   -10e4   1576644030");
-        //let ts = SystemTime::now().duration_since(time::UNIX_EPOCH).unwrap();
-        //let ts: Bytes = ts.as_secs().to_string().into();
+        let input = Bytes::from("gorets.bobez.1;tag2=value;tag1=value 1000 1576644030\n\ngorets.bobez.2;tag2=value2;tag1=value   -10e4   1576644030\n");
 
         let mut runtime = Builder::new()
             .basic_scheduler()
             .enable_all()
             .build()
             .expect("creating runtime for main thread");
-        //let (bufs_tx, bufs_rx) = channel(10);
 
+        let (sched_tx, mut sched_rx) = channel(c!(task_queue_size));
         // spawn carbon server
-        let server = CarbonServer::new();
+        let server = CarbonServer::new(sched_tx);
         runtime.spawn(server.main());
-        // let receiver = bufs_rx.for_each(move |msg| {
-        ////if bufs_rx != "qwer.asdf.zxcv1 20 "
-        ////TODO correct test
-        //println!("RECV: {:?}", msg);
-        //Ok(())
-        //});
 
-        //runtime.spawn(receiver);
+        let counter = Counter::new(2);
+        let expected = vec![
+            new_named_metric(b"gorets.bobez.1;tag1=value;tag2=value", 1000.0, 1576644030),
+            new_named_metric(
+                &b"gorets.bobez.2;tag1=value;tag2=value2"[..],
+                -100000.0,
+                1576644030,
+            ),
+        ];
+
+        let c = counter.clone();
+        let receiver = async move {
+            let metric = sched_rx.recv().await.unwrap();
+
+            assert_eq!(metric, expected[0]);
+            c.dec().await;
+
+            let metric = sched_rx.recv().await.unwrap();
+            //dbg!(&metric);
+            assert_eq!(metric, expected[1]);
+            c.dec().await;
+
+            // TODO: must be None when server close implemented
+            // TODO: make counter = 3 and dec it here to check if await was really unblocked
+            sched_rx.recv().await.unwrap();
+        };
+
+        runtime.spawn(receiver);
 
         // connect to same address server is listening
         let addr: SocketAddr = c!(listen);
@@ -313,22 +304,9 @@ mod tests {
             conn.write_all(&input).await?;
             Ok::<(), io::Error>(())
         };
-        runtime.spawn(sender);
-        //let writer = CarbonEncoder.framed(conn);
-        //let sender = writer
-        //.send(("qwer.asdf.zxcv1".into(), "10".into(), ts.clone()))
-        //.and_then(move |writer| {
-        //writer.send(("qwer.asdf.zxcv2".into(), "20".into(), ts.clone()))
-        //})
-        //.map(|_| ())
-        //.map_err(|_| ());
-        //spawn(sender.map_err(|_| ()));
-        //Ok(())
-        //});
 
-        //runtime.spawn(sender.map_err(|_| ()));
-        //runtime.block_on(receiver).expect("runtime");
-        let test_delay = async { tokio::time::delay_for(Duration::from_secs(2)).await };
-        runtime.block_on(test_delay);
+        runtime.spawn(sender);
+
+        runtime.block_on(counter.zero_after(3)).unwrap();
     }
 }
