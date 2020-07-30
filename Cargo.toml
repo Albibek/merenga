@@ -20,7 +20,7 @@ slog-stdlog="^4.0"
 
 futures = "^0.3"
 bytes = { version = "^0.5", features = [ "serde" ] }
-tokio = { version = "^0.2", features = ["net", "time", "sync", "macros", "io-util", "io-driver", "rt-core", "rt-threaded", "blocking", "signal"] }
+tokio = { version = "^0.2", features = ["net", "time", "sync", "macros", "io-util", "io-driver", "rt-core", "rt-threaded", "rt-util", "blocking", "signal"] }
 tokio-util = { version = "^0.2", features = ["codec"] }
 trust-dns-resolver = { version = "^0.19" }
 

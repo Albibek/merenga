@@ -37,6 +37,7 @@ pub struct CarbonClient {
     input: RingMetricReceiver,
     own: UnboundedSender<(Bytes, usize)>,
     backoff: Backoff,
+    scale: usize,
     config_hash: u64,
 }
 
@@ -54,10 +55,19 @@ impl CarbonClient {
                 input: rx,
                 own,
                 backoff: Backoff::default(),
+                scale: config.scale,
                 config_hash: c!(hash),
             },
             tx,
         )
+    }
+
+    pub(crate) async fn scaled(self) {
+        let mut handles = Vec::new();
+        for _ in 0..self.scale {
+            handles.push(spawn(self.clone().retried()));
+        }
+        futures::future::join_all(handles).await;
     }
 
     pub(crate) async fn retried(mut self) -> Result<(), CarbonClientError> {
@@ -110,7 +120,7 @@ impl CarbonClient {
                             Some(m) => {
                                 egress += 1;
                                 codec.send(m).map_err(|e|{s!(errors); e}).await?
-                                },
+                            },
                             None => break,
                         }
                     },
@@ -166,16 +176,10 @@ impl Decoder for CarbonEncoder {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::time::Duration;
 
-    use bytes::Bytes;
     use futures::TryFutureExt;
-    use tokio::prelude::*;
     use tokio::runtime::Builder;
-    use tokio::sync::mpsc::channel;
 
-    use crate::c;
-    use crate::config::CONFIG;
     use crate::util::test::*;
 
     #[test]

@@ -7,7 +7,7 @@ use log::{debug, error, warn};
 use thiserror::Error;
 
 use bytes::{BufMut, Bytes, BytesMut};
-use futures::{Future, TryFutureExt};
+use futures::{Future, TryFutureExt, TryFuture};
 use ring_channel::{RingReceiver, RingSender};
 use tokio::select;
 use tokio::signal::unix::{signal, SignalKind};
@@ -26,7 +26,7 @@ macro_rules! s {
         STATS
             .$path
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-    }};
+        }};
 }
 
 pub type RingMetricSender = RingSender<NamedMetric64>;
@@ -116,27 +116,22 @@ impl Backoff {
     }
 }
 
-/*
- * TODO
-pub async fn retry_with_backoff<F, I, O, R, E>(c: Backoff, f: F, onerr: O) -> Result<R, E>
+pub async fn retry_with_backoff<F, I, R, E>(c: Backoff, mut f: F) -> Result<R, E>
 where
     I: Future<Output = Result<R, E>>,
-    F: Fn() -> I,
-    O: Fn(&E),
-{
-    loop {
-        let mut bo = c.clone();
-        match f().await {
-            Ok(v) => break Ok(v),
-            Err(e) => {
-                onerr(&e);
-                bo.sleep().await?;
-                continue;
+    F: FnMut() -> I,
+    {
+        loop {
+            let mut bo = c.clone();
+            match f().await {
+                r @ Ok(_) => break r,
+                Err(e) => {
+                    bo.sleep().map_err(|()| e).await?;
+                    continue;
+                }
             }
         }
     }
-}
-  */
 
 pub async fn config_watcher(notify: tokio::sync::mpsc::UnboundedSender<()>) {
     // An infinite stream of hangup signals.
@@ -342,8 +337,8 @@ pub(crate) mod test {
             Duration::from_secs(1),
             input.map(|m| m.unwrap()).collect::<Vec<_>>(),
         )
-        .await
-        .map_err(|_| ())?;
+            .await
+            .map_err(|_| ())?;
 
         metrics.sort_by(|m1, m2| m1.name.name.partial_cmp(&m2.name.name).unwrap());
         expected.sort_by(|m1, m2| m1.name.name.partial_cmp(&m2.name.name).unwrap());

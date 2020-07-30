@@ -154,7 +154,7 @@ impl Scheduler {
                 self.backends
                     .drain(..)
                     .map(|backend| {
-                        spawn(backend.retried());
+                        spawn(backend.scaled());
                     })
                     .last();
 

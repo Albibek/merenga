@@ -216,6 +216,9 @@ pub struct Backend {
     /// lenght of the ring buffer in items(i.e. metrics)
     pub queue_len: usize,
 
+    /// Number of instances of this backend
+    pub scale: usize,
+
     // the value we'll get after checking size
     #[serde(skip)]
     pub(crate) checked_queue_len: NonZeroUsize,
@@ -227,6 +230,7 @@ impl Default for Backend {
             address: "127.0.0.1:2003".parse().unwrap(),
             queue_len: 65536,
             checked_queue_len: NonZeroUsize::new(65536).unwrap(),
+            scale: 1,
         }
     }
 }
@@ -239,17 +243,27 @@ impl Backend {
     }
 }
 
+#[derive(Debug, Clone, Copy, Hash, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case", deny_unknown_fields)]
+pub enum ClusterStrategy {
+    Even,
+}
+
 #[derive(Debug, Clone, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case", default, deny_unknown_fields)]
 pub struct Cluster {
     /// list of backend addresses to send metrics to
     pub backends: Vec<String>,
+
+    /// strategy to use for multiple backends
+    pub strategy: ClusterStrategy,
 }
 
 impl Default for Cluster {
     fn default() -> Self {
         Self {
             backends: Vec::new(),
+            strategy: ClusterStrategy::Even,
         }
     }
 }
