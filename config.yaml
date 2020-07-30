@@ -3,11 +3,12 @@ listen: "127.0.0.1:2003"
 
 backends:
     main:
+        scale: 10
         address: "localhost:2004"
 
 rules:
 - match: "bad-prefix"
-  routes: []
+  forward: []
 - match: "apps.*"
-  routes:
+  forward:
       - main

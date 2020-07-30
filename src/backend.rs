@@ -4,7 +4,7 @@ use thiserror::Error;
 
 use bytes::{buf::BufMutExt, BufMut, Bytes, BytesMut};
 use futures::{Future, SinkExt, StreamExt, TryFutureExt, TryStream};
-use log::{error, warn};
+use log::{debug, error, warn};
 use tokio::net::TcpStream;
 use tokio::sync::mpsc::UnboundedSender;
 use tokio::{select, spawn};
@@ -104,6 +104,7 @@ impl CarbonClient {
     }
 
     pub(crate) async fn main(mut self) -> Result<(), CarbonClientError> {
+        debug!("starting backend");
         let addr = resolve_with_port(&self.addr, 2003).await?;
         let conn = TcpStream::connect(addr.clone()).await?;
         let mut codec = CarbonEncoder.framed(conn);
@@ -180,6 +181,8 @@ mod tests {
     use futures::TryFutureExt;
     use tokio::runtime::Builder;
 
+    use tokio::sync::mpsc::unbounded_channel;
+
     use crate::util::test::*;
 
     #[test]
@@ -194,8 +197,12 @@ mod tests {
 
         let mut cfg = crate::config::Backend::default();
         cfg.address = "localhost:2004".into();
+        cfg.scale = 4;
         cfg.build().unwrap();
-        let (backend, mut tx) = CarbonClient::new(cfg);
+        let (own_tx, mut own_rx) = unbounded_channel();
+        runtime.spawn(async move { for _ in own_rx.recv().await {} });
+
+        let (backend, mut tx) = CarbonClient::new(cfg, "test_backend".into(), own_tx);
         let metrics = vec![
             new_named_metric(
                 &b"apps.gorets.bobez.1;tag1=value1;tag2=value2"[..],

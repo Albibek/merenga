@@ -207,16 +207,13 @@ impl Scheduler {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::time::Duration;
 
-    use bytes::Bytes;
     use futures::FutureExt;
-    use tokio::prelude::*;
     use tokio::runtime::Builder;
     use tokio::sync::mpsc::channel;
+    use tokio::sync::mpsc::unbounded_channel;
 
     use crate::c;
-    use crate::config::CONFIG;
     use crate::util::test::*;
 
     #[test]
@@ -230,8 +227,10 @@ mod tests {
             .expect("creating runtime for main thread");
 
         let (mut sched_tx, sched_rx) = channel(c!(task_queue_size));
+        let (own_tx, mut own_rx) = unbounded_channel();
+        runtime.spawn(async move { for _ in own_rx.recv().await {} });
 
-        let scheduler = Scheduler::new();
+        let scheduler = Scheduler::new(own_tx);
         let metrics = vec![
             // must be fileterd out
             new_named_metric(
@@ -302,6 +301,8 @@ mod tests {
         .and_then(|_| counter.dec().unit_error());
         // TODO: internal metric of failed metrics should be 0
 
+        let (_, rel_rx) = unbounded_channel();
+
         let everything = async {
             futures::try_join!(
                 counter.zero_after(3),
@@ -309,7 +310,7 @@ mod tests {
                 main_listener,
                 unmatched_listener,
                 rewrite_listener,
-                scheduler.main(sched_rx).map_err(|_| ()),
+                scheduler.main(sched_rx, rel_rx).map_err(|_| ()),
             )
         };
 
