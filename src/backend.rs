@@ -140,11 +140,10 @@ impl CarbonClient {
 
 pub struct CarbonEncoder;
 
-impl Encoder for CarbonEncoder {
-    type Item = NamedMetric64;
+impl Encoder<NamedMetric64> for CarbonEncoder {
     type Error = CarbonClientError;
 
-    fn encode(&mut self, m: Self::Item, buf: &mut BytesMut) -> Result<(), Self::Error> {
+    fn encode(&mut self, m: NamedMetric64, buf: &mut BytesMut) -> Result<(), Self::Error> {
         // it's too long to count characters for each number
         // anyways, we most probably write more that one metric, so allocating 20 bytes for float and 20 for u64 saves CPU at the cost of little memory and
         // few extra allocs in rare edge cases

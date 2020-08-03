@@ -7,7 +7,7 @@ use log::{debug, error, warn};
 use thiserror::Error;
 
 use bytes::{BufMut, Bytes, BytesMut};
-use futures::{Future, TryFutureExt, TryFuture};
+use futures::{Future, TryFuture, TryFutureExt};
 use ring_channel::{RingReceiver, RingSender};
 use tokio::select;
 use tokio::signal::unix::{signal, SignalKind};
@@ -26,7 +26,7 @@ macro_rules! s {
         STATS
             .$path
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        }};
+    }};
 }
 
 pub type RingMetricSender = RingSender<NamedMetric64>;
@@ -120,18 +120,18 @@ pub async fn retry_with_backoff<F, I, R, E>(c: Backoff, mut f: F) -> Result<R, E
 where
     I: Future<Output = Result<R, E>>,
     F: FnMut() -> I,
-    {
-        loop {
-            let mut bo = c.clone();
-            match f().await {
-                r @ Ok(_) => break r,
-                Err(e) => {
-                    bo.sleep().map_err(|()| e).await?;
-                    continue;
-                }
+{
+    loop {
+        let mut bo = c.clone();
+        match f().await {
+            r @ Ok(_) => break r,
+            Err(e) => {
+                bo.sleep().map_err(|()| e).await?;
+                continue;
             }
         }
     }
+}
 
 pub async fn config_watcher(notify: tokio::sync::mpsc::UnboundedSender<()>) {
     // An infinite stream of hangup signals.
@@ -296,6 +296,23 @@ pub(crate) mod test {
     use crate::carbon::CarbonDecoder;
     use crate::config::CONFIG;
 
+    use log::{Level, Metadata, Record};
+
+    pub(crate) static LOG: TestLogger = TestLogger;
+    pub(crate) struct TestLogger;
+
+    impl log::Log for TestLogger {
+        fn enabled(&self, metadata: &Metadata) -> bool {
+            true
+        }
+
+        fn log(&self, record: &Record) {
+            println!("{} - {}", record.level(), record.args());
+        }
+
+        fn flush(&self) {}
+    }
+
     // multiple tests are run in parallel, but we only want to parse config once
     static TEST_CONFIG_DONE: std::sync::Once = std::sync::Once::new();
 
@@ -337,8 +354,8 @@ pub(crate) mod test {
             Duration::from_secs(1),
             input.map(|m| m.unwrap()).collect::<Vec<_>>(),
         )
-            .await
-            .map_err(|_| ())?;
+        .await
+        .map_err(|_| ())?;
 
         metrics.sort_by(|m1, m2| m1.name.name.partial_cmp(&m2.name.name).unwrap());
         expected.sort_by(|m1, m2| m1.name.name.partial_cmp(&m2.name.name).unwrap());

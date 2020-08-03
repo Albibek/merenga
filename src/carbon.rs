@@ -7,7 +7,7 @@ use bytes::{Buf, BytesMut};
 use futures::stream::StreamExt;
 use futures::TryFutureExt;
 use log::info;
-use tokio::net::{TcpListener, TcpStream};
+use tokio::net::TcpListener;
 use tokio::spawn;
 
 use tokio_util::codec::{Decoder, Encoder};
@@ -102,6 +102,8 @@ pub struct CarbonDecoder {
     sort_buf: Vec<u8>,
     last_pos: usize,
     max_len: usize,
+
+    log_parse_errors: bool,
 }
 
 impl CarbonDecoder {
@@ -110,6 +112,7 @@ impl CarbonDecoder {
             last_pos: 0,
             sort_buf: vec![0u8; max_len],
             max_len,
+            log_parse_errors: c!(log_parse_errors),
         }
     }
 
@@ -149,29 +152,45 @@ impl Decoder for CarbonDecoder {
     type Error = CarbonServerError;
 
     fn decode(&mut self, buf: &mut BytesMut) -> Result<Option<Self::Item>, Self::Error> {
-        if buf.len() == 0 {
+        let len = buf.len();
+        if len == 0 {
             self.last_pos = 0;
             return Ok(None);
         }
 
-        let log_parse_errors = c!(log_parse_errors);
         // we need  loop here for skipping parsing errors, it only continues when there is an error
         // between some newlines
         // in all good cases it just returns
         loop {
+            // we must check len every iteraton because buf can advance to len = 0
             let len = buf.len();
+            if len == 0 {
+                self.last_pos = 0;
+                return Ok(None);
+            }
+
             // we dont' do any job until we meet a new line or we are at eof
             // (or eof, but this case is in decode_eof function)
-            match &buf[self.last_pos..len].iter().position(|c| *c == b'\n') {
+            match &buf[self.last_pos..len]
+                .iter()
+                //.position(|c| *c == b'\n')
+                // some carbon clients send \r\n and we suppose some of them can send \r as well
+                // so we have nothing to do than consider any of those a newline
+                .position(|c| *c == b'\n' || *c == b'\r')
+            {
                 Some(pos) => {
                     let line = buf.split_to(self.last_pos + *pos);
                     buf.advance(1); // remove \n itself
                     self.last_pos = 0;
-                    let eline = if log_parse_errors {
+                    let eline = if self.log_parse_errors {
                         Some(line.clone())
                     } else {
                         None
                     };
+                    if line.len() == 0 {
+                        // fast path to avoid parsing empty lines
+                        continue;
+                    }
                     match self.parse_line(line) {
                         Ok(res) => return Ok(Some(res)),
                         Err(e) => {
@@ -196,9 +215,11 @@ impl Decoder for CarbonDecoder {
                         self.last_pos = 0;
                     } else {
                         // otherways it's still ok
+                        // we may have overflown here when len == 0, but we do a check at the start
+                        // of the loop every time
                         self.last_pos = len - 1;
                     }
-                    //  regardless of result we have not anough data to do anything
+                    //  regardless of result we have not enough data to do anything
                     return Ok(None);
                 }
             }
@@ -230,11 +251,10 @@ impl Decoder for CarbonDecoder {
     }
 }
 
-impl Encoder for CarbonDecoder {
-    type Item = ();
+impl Encoder<()> for CarbonDecoder {
     type Error = CarbonServerError;
 
-    fn encode(&mut self, _: Self::Item, _buf: &mut BytesMut) -> Result<(), Self::Error> {
+    fn encode(&mut self, _: (), _buf: &mut BytesMut) -> Result<(), Self::Error> {
         unreachable!()
     }
 }
@@ -242,14 +262,13 @@ impl Encoder for CarbonDecoder {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::time::Duration;
 
     use bytes::Bytes;
+    use tokio::net::TcpStream;
     use tokio::prelude::*;
     use tokio::runtime::Builder;
     use tokio::sync::mpsc::channel;
 
-    use crate::config::CONFIG;
     use crate::util::test::*;
 
     #[test]
@@ -308,5 +327,23 @@ mod tests {
         runtime.spawn(sender);
 
         runtime.block_on(counter.zero_after(3)).unwrap();
+    }
+
+    #[test]
+    fn parse_newlines() {
+        log::set_logger(&crate::util::test::LOG)
+            .map(|()| log::set_max_level(log::LevelFilter::Debug))
+            .unwrap();
+
+        let mut decoder = CarbonDecoder::new(1000);
+        let mut input = BytesMut::from("qwer.asdf.zxcv 1000 1576644030\r\nzxcv.asdf.qwer 10 1576644030\rpoiupoiu.kjhkjhg 1 1576644030\r\r\n\n\nitruyturt.tfytfuytf.uytf 5 1576644030");
+
+        let mut count = 0;
+        while let Some(res) = decoder.decode_eof(&mut input).unwrap() {
+            //dbg!(res);
+            //dbg!(&input);
+            count += 1;
+        }
+        assert_eq!(count, 4);
     }
 }

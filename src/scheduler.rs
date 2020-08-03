@@ -258,14 +258,14 @@ mod tests {
             ),
         ];
 
-        let mut expected_main = vec![metrics[2].clone()];
+        let expected_main = vec![metrics[2].clone()];
         let expected_rewritten = vec![new_named_metric(
             &b"apps.rewritten.gorets.bobez.2;tag1=value1;tag2=value2"[..],
             10001.0,
             1576644030,
         )];
 
-        let mut expected_unmatched = vec![
+        let expected_unmatched = vec![
             //
             metrics[2].clone(),
             metrics[3].clone(),

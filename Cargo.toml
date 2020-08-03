@@ -1,7 +1,7 @@
 [package]
 name = "merenga"
 description = "Metric router and aggregator for carbon protocol"
-version = "0.1.0"
+version = "0.1.1"
 authors = ["Sergey Noskov <snoskov@avito.ru>"]
 edition = "2018"
 
@@ -21,7 +21,7 @@ slog-stdlog="^4.0"
 futures = "^0.3"
 bytes = { version = "^0.5", features = [ "serde" ] }
 tokio = { version = "^0.2", features = ["net", "time", "sync", "macros", "io-util", "io-driver", "rt-core", "rt-threaded", "rt-util", "blocking", "signal"] }
-tokio-util = { version = "^0.2", features = ["codec"] }
+tokio-util = { version = "^0.3", features = ["codec"] }
 trust-dns-resolver = { version = "^0.19" }
 
 ring-channel = {version = "^0.8", features = ["futures_api"]}
